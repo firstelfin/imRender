@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 
@@ -10,7 +10,7 @@ dynamic = ["version"]
 description = "."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "Apache-2.0"
+license = { text = "Apache-2.0"}
 classifiers = [
     "Programming Language :: Python :: 3",
 ]
@@ -24,7 +24,7 @@ version = { attr = "imRender.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["imRender/*"]
+include = ["imRender", "imRender.*"]
 
 [project.scripts]
 # 命令 = "包名.模块:函数"
