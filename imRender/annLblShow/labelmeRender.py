@@ -184,7 +184,8 @@ class LabelmeChineseRenderer:
         # 渲染每个检测目标
         shapes: List[Dict[str, Any]] = annotation.get('shapes', [])
         for shape in shapes:
-            if just_flags and shape.get("flags", {}).get("show", False):
+            flags: dict[str, bool] = shape.get("flags", {})
+            if just_flags and True not in flags.values():
                 continue
             bbox = self.get_bounding_box_from_shape(shape)  # 获取边界框
             class_name = shape.get('label', 'Unknown')
