@@ -12,20 +12,79 @@ from tqdm import tqdm
 from pathlib import Path
 from loguru import logger
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional, Union
 from PIL import Image, ImageDraw, ImageFont
 
 warnings.filterwarnings('ignore')
 
 
 class LabelmeChineseRenderer:
+    """labelme格式标签渲染器
+
+    渲染逻辑是调用时通过just_flags参数控制是否优先使用shape内指定的flags信息渲染, 其次使用类别名查找渲染等级,
+    两种方式都需要使用flags_key_map转义关键字. 若都没有指定, 则使用默认配置default_report.
+
+    Attribute:
+        font_path: 字体文件路径, defaults to Path.home()/".config/elfin/fonts/Arial.Unicode.ttf"
+        verbose: 是否打印渲染细节, defaults to False
+        flags_key_map: 类别名(标记名)到渲染等级的映射字典, defaults to {}
+        default_report: 默认渲染等级与渲染颜色组成的元组, defaults to None
+
+    Example:
+
+        >>> from imRender import LabelmeChineseRenderer
+        # 自定义类别渲染
+        >>> renderer = LabelmeChineseRenderer(
+        ...     font_path=Path.home() / ".config/elfin/fonts/Arial.Unicode.ttf",
+        ...     verbose=False,
+        ...     flags_key_map={
+        ...         "person": "critical",  # 指定渲染类别的等级
+        ...         "car": "high",
+        ...     }
+        ... )
+        # 使用标注实例中的flags自定义的渲染
+        >>> renderer = LabelmeChineseRenderer(
+        ...     font_path=Path.home() / ".config/elfin/fonts/Arial.Unicode.ttf",
+        ...     verbose=False,
+        ... )
+        # 自定义默认渲染等级与渲染颜色
+        >>> renderer = LabelmeChineseRenderer(
+        ...     font_path=Path.home() / ".config/elfin/fonts/Arial.Unicode.ttf",
+        ...     verbose=False,
+        ...     default_report=("critical", (0, 0, 255))  # 红色 - 关键/严重问题
+        ... )
+        # 调用单张图片渲染
+        >>> renderer.render_image(
+        ...     image_path="path/to/image",  # 可以直接传图像数据ndarray
+        ...     json_path="path/to/json",    # 可以直接传labelme格式的标注字典
+        ...     output_path="path/to/save_image",
+        ...     just_flags=True,  # 只使用标注中的flags信息渲染, 未标记的实例不渲染
+        ...     show_score=True,  # 渲染时带上置信度
+        ...     ind=0,  # 当前图像的序号
+        ... )
+        # 批次调用
+        >>> renderer.render_batch(
+        ...     images_dir=Path("path/to/images"),
+        ...     labels_dir=Path("path/to/labels") or None,
+        ...     output_dir=Path("render_images/"),
+        ...     just_flags=False,  # 未使用flags标记的标签也要渲染
+        ...     show_score=True,
+        ... )
+    """
 
     def __init__(
             self,
             font_path=Path.home() / ".config/elfin/fonts/Arial.Unicode.ttf",
             verbose: bool = False,
             flags_key_map: Dict[str, str] = {},
+            default_report: Optional[Tuple[str, Tuple[int, int, int]]] = None,
         ):
+        """
+        :param Union[Path, str] font_path: Path to font file, defaults to Path.home()/".config/elfin/fonts/Arial.Unicode.ttf"
+        :param bool verbose: Whether to display rendering details, defaults to False
+        :param Dict[str, str] flags_key_map: Mapping dictionary from category to rendering level, defaults to {}
+        :param Optional[Tuple[str, Tuple[int]]] default_report: Default rendering level and BGR value, defaults to None
+        """
         self.verbose = verbose
         # 定义汇报级别对应的颜色 (BGR格式)
         self.report_level_colors = {
@@ -45,6 +104,13 @@ class LabelmeChineseRenderer:
         self.font_path = font_path
         self.ascent, self.descent = self.font.getmetrics()
         self.image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
+        if default_report is None:
+            self.default_report = "default", self.report_level_colors["default"]
+        else:
+            self.default_report = default_report
+            assert self.default_report[0] in self.report_level_colors, \
+                "The rendering level is not within the configuration range"
+            assert len(self.default_report[1]) == 3, "The color value is not in BGR format"
     
     def load_labelme_annotation(self, json_path: str | Path) -> Dict[str, Any]:
         """Load labelme annotation file."""
@@ -61,19 +127,26 @@ class LabelmeChineseRenderer:
         y_max = int(points[:, 1].max())
         return x_min, y_min, x_max, y_max
     
-    def get_report_level(self, flags: Dict[str, bool]) -> Tuple[str, Tuple[int, int, int]]:
+    def get_report_level(self, flags: Dict[str, bool], lbl_name: Optional[str] = None) -> Tuple[str, Tuple[int, int, int]]:
         """Get the level of rendering required for the current instance.
 
         :param Dict[str, bool] flags: labelme flags
+        :param Optional[str] lbl_name: label name, defaults to None
         :return Tuple[str, Tuple[int, int, int]]: report level
         """
 
+        # Retrieve rendering level from flags in labelme annotation instances
         new_flags = {self.flags_key_map.get(flag_key, flag_key): flag_value for flag_key, flag_value in flags.items()}
         for key, value in self.report_level_colors.items():
             if new_flags.get(key, False):
                 return key, value
+        # Retrieve rendering level from label name in labelme annotation instances
+        if lbl_name is not None:
+            lbl_level_key = self.flags_key_map.get(lbl_name, lbl_name)
+            if lbl_level_key in self.report_level_colors:
+                return lbl_level_key, self.report_level_colors[lbl_level_key]
 
-        return "default", self.report_level_colors["default"]
+        return self.default_report
     
     def get_confidence(self, shape: Dict[str, Any]) -> float:
         """Obtain confidence level from labelme instance."""
@@ -111,20 +184,15 @@ class LabelmeChineseRenderer:
                          class_name: str, confidence: float, report: Tuple) -> np.ndarray:
         """Draw bbox and label information on the image.
 
-        :param image: _description_
-        :type image: np.ndarray
-        :param bbox: _description_
-        :type bbox: Tuple[int, int, int, int]
-        :param class_name: _description_
-        :type class_name: str
-        :param confidence: _description_
-        :type confidence: float
-        :param report_level: _description_
-        :type report_level: str
-        :return: _description_
-        :rtype: np.ndarray
+        :param np.ndarray image: The graphic to be drawn
+        :param Tuple[int, int, int, int] bbox: Coordinates of anchor box
+        :param str class_name: Category Name
+        :param float confidence: Confidence level of instances
+        :param Tuple report: (level, color) of rendering
+        :return np.ndarray: Rendered graphics
         """
-        valid_bbox = self.bbox_valid(bbox, image.shape[:2])
+        img_h, img_w = image.shape[:2]
+        valid_bbox = self.bbox_valid(bbox, (img_h, img_w))
         if not valid_bbox:
             return image
         x_min, y_min, x_max, y_max = valid_bbox
@@ -162,24 +230,28 @@ class LabelmeChineseRenderer:
 
     def render_image(
             self,
-            image_path: str,
-            json_path: str,
+            image_path: Union[str, np.ndarray],
+            json_path: Union[str, Dict],
             output_path: str,
-            just_flags: bool = True,
+            just_flags: bool = False,
             show_score: bool = True,
             ind: int = 0
         ) -> np.ndarray:
         """Render a single image for display and save to a specified address."""
 
-        chech_info = f" Please check the file[index={ind}]."
+        check_info = f" Please check the file[index={ind}]."
         # 加载图像
-        image = cv.imread(image_path)
-        if image is None: raise ValueError(f"Unable to load image: {image_path}." + chech_info)
+        image = cv.imread(image_path) if isinstance(image_path, str) else image_path
+        if image is None:
+            raise ValueError(f"Unable to load image: {image_path}." + check_info)
         
         # 检查标注文件是否存在
-        if not Path(json_path).exists(): raise ValueError(f"The annotation file {json_path} does not exist." + chech_info)
-        
-        annotation = self.load_labelme_annotation(json_path)
+        if isinstance(json_path, dict):
+            annotation = json_path
+        elif not Path(json_path).exists():
+            raise ValueError(f"The annotation file {json_path} does not exist." + check_info)
+        else:
+            annotation = self.load_labelme_annotation(json_path)
         
         # 渲染每个检测目标
         shapes: List[Dict[str, Any]] = annotation.get('shapes', [])
@@ -190,7 +262,7 @@ class LabelmeChineseRenderer:
             bbox = self.get_bounding_box_from_shape(shape)  # 获取边界框
             class_name = shape.get('label', 'Unknown')
             confidence = self.get_confidence(shape)
-            report = self.get_report_level(flags=shape.get("flags", {}))
+            report = self.get_report_level(flags=flags)
             image = self.draw_bounding_box(image, bbox, class_name, confidence if show_score else -1, report)
         
         # 确保输出目录存在
@@ -198,13 +270,15 @@ class LabelmeChineseRenderer:
         
         # 保存图像到指定地址
         success = cv.imwrite(output_path, image)
-        if not success: raise ValueError(f"Unable to save image to: {output_path}." + chech_info)
+        if not success:
+            raise ValueError(f"Unable to save image to: {output_path}." + check_info)
 
-        if self.verbose: logger.info(f"The image has been rendered and saved to: the {output_path}" + chech_info)
+        if self.verbose:
+            logger.info(f"The image has been rendered and saved to: the {output_path}" + check_info)
         
         return image
     
-    def load_img_lbls(self, img_dir: Path, lbl_dir: Path | None = None):
+    def load_img_lbls(self, img_dir: Path, lbl_dir: Optional[Path] = None):
         """Match images and labels."""
         img_files = [f for f in img_dir.rglob("*") if f.suffix.lower() in self.image_extensions]
         if lbl_dir is None:
@@ -217,17 +291,17 @@ class LabelmeChineseRenderer:
     def render_batch(
             self, 
             images_dir: Path, 
-            labels_dir: Path | None, 
-            output_dir: Path, 
-            just_flags: bool = True, 
+            labels_dir: Optional[Path] = None, 
+            output_dir: Path = Path("render_images/"), 
+            just_flags: bool = False, 
             show_score: bool = True
         ):
         """Batch processing of image rendering.
 
         :param Path images_dir: images directory
-        :param Path | None labels_dir: labels directory
+        :param Optional[Path] labels_dir: labels directory
         :param Path output_dir: output directory
-        :param bool, optional just_flags: only show labeled objects in flags, defaults to True
+        :param bool, optional just_flags: only show labeled objects in flags, defaults to False
         :param bool, optional show_score: show confidence score, defaults to True
         """
 
