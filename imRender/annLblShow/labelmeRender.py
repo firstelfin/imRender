@@ -4,6 +4,7 @@
 # @time: 2025/09/27 10:14:47
 
 import os
+import gc
 import json
 import warnings
 import cv2 as cv
@@ -78,14 +79,17 @@ class LabelmeChineseRenderer:
             verbose: bool = False,
             flags_key_map: Dict[str, str] = {},
             default_report: Optional[Tuple[str, Tuple[int, int, int]]] = None,
+            skip_existed: bool = True,
         ):
         """
         :param Union[Path, str] font_path: Path to font file, defaults to Path.home()/".config/elfin/fonts/Arial.Unicode.ttf"
         :param bool verbose: Whether to display rendering details, defaults to False
         :param Dict[str, str] flags_key_map: Mapping dictionary from category to rendering level, defaults to {}
         :param Optional[Tuple[str, Tuple[int]]] default_report: Default rendering level and BGR value, defaults to None
+        :param bool skip_existed: Whether to skip rendering when the output file exists, defaults to True
         """
         self.verbose = verbose
+        self.skip_existed = skip_existed
         # 定义汇报级别对应的颜色 (BGR格式)
         self.report_level_colors = {
             "critical": (0, 0, 255),      # 红色 - 关键/严重问题
@@ -239,6 +243,10 @@ class LabelmeChineseRenderer:
         ) -> np.ndarray:
         """Render a single image for display and save to a specified address."""
 
+        if self.skip_existed and Path(output_path).exists():
+            image = cv.imread(str(output_path))
+            if image is not None:
+                return image
         check_info = f" Please check the file[index={ind}]."
         # 加载图像
         image = cv.imread(image_path) if isinstance(image_path, str) else image_path
@@ -275,7 +283,8 @@ class LabelmeChineseRenderer:
 
         if self.verbose:
             logger.info(f"The image has been rendered and saved to: the {output_path}" + check_info)
-        
+        gc.collect()
+
         return image
     
     def load_img_lbls(self, img_dir: Path, lbl_dir: Optional[Path] = None):
@@ -316,20 +325,25 @@ class LabelmeChineseRenderer:
         
         # 批量渲染图像
         workers = os.cpu_count()
-        workers = max(4, workers // 2) if workers is not None else 4
-        res = []
+        workers = max(2, workers // 4) if workers is not None else 2
+        res = dict()
         with ThreadPoolExecutor(max_workers=workers) as executor:
             ind = 0
             for img_file, lbl_file, out_file in zip(img_files, lbl_files, out_files):
-                res.append(
-                    executor.submit(
-                        self.render_image, str(img_file), str(lbl_file), str(out_file),
-                        just_flags=just_flags, show_score=show_score, ind=ind,
-                    )
+                if self.skip_existed and out_file.exists():
+                    continue
+                future_res = executor.submit(
+                    self.render_image, str(img_file), str(lbl_file), str(out_file),
+                    just_flags=just_flags, show_score=show_score, ind=ind,
                 )
+                res[future_res] = img_file.name
                 ind += 1
             
             # 生成执行进度条
             exec_bar = tqdm(as_completed(res), total=len(res), desc="RenderingImages", colour="#CD8500")
             for ft in exec_bar:
-                ft.result()
+                try:
+                    ft.result()
+                except Exception as e:
+                    logger.error(f"Failed to render image: {res[ft]} with error: {e}")
+                del res[ft]
